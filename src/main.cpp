@@ -1,1602 +1,595 @@
-/*
-  ============================================================
-  SMART MAINTENANCE 360
-  ESP32 + Wokwi + Blynk IoT + MQTT + Web Dashboard
-  ============================================================
+// --- Blynk Phone App Setup Information ---
+#define BLYNK_TEMPLATE_ID "TMPL3hQVuw2Ou"               // Unique ID code for your Blynk project template
+#define BLYNK_TEMPLATE_NAME "SAFEBAND AI"               // Name of your mobile app project
+#define BLYNK_AUTH_TOKEN "xz8GG1DYeFlCqVRPPE_OV6s6WRI3e1U0" // Secret password key connecting device to your phone app
+#define BLYNK_PRINT Serial                              // Shows debug messages from Blynk on your computer screen
 
-  Wokwi Sensors:
-    DS18B20  -> Temperature       GPIO 4
-    MPU6050  -> Vibration         SDA 21, SCL 22
-    Pot #1   -> Simulated Current GPIO 34
-    Pot #2   -> Simulated RPM     GPIO 35
+// --- Helper Software Libraries ---
+#include <Arduino.h>           // Basic command rules for the ESP32 chip
+#include <Wire.h>              // Software to talk to screen and sensors using 2 wires
+#include <WiFi.h>              // Software to connect device to wireless WiFi internet
+#include <BlynkSimpleEsp32.h>  // Software to send and receive data from Blynk phone app
+#include <Adafruit_GFX.h>      // Drawing toolkit for screens (letters, numbers, lines)
+#include <Adafruit_SSD1306.h>  // Driver code made specifically for small OLED screens
 
-  Outputs:
-    Green LED   -> GPIO 26
-    Yellow LED  -> GPIO 25
-    Red LED     -> GPIO 33
-    Buzzer      -> GPIO 32
-    Button      -> GPIO 13
+// --- Main Settings ---
+#define SIM_MODE       true    // Set to true so control knobs simulate Heart Rate and Battery
+#define ENABLE_WIFI    true    // Set to true to allow connecting to WiFi and Blynk
+#define DISCREET_MODE  true    // Set to true for gentle vibration clicks instead of loud alarm noise
 
-  Button:
-    Press once = Fault Mode ON
-    Press again = Fault Mode OFF
-*/
+// --- WiFi Internet Details ---
+static const char* BAND_ID     = "SB-AI-01";    // Unique name given to this specific smart band
+static const char* WIFI_SSID   = "Wokwi-GUEST";  // Name of the WiFi router network
+static const char* WIFI_PASS   = "";             // Password for WiFi router network (blank for open WiFi)
 
-// ============================================================
-// BLYNK
-// ============================================================
+// --- Default GPS Location (Mumbai baseline) ---
+float gpsLat = 19.0760f; // Starting Latitude map coordinate
+float gpsLon = 72.8777f; // Starting Longitude map coordinate
 
-#define BLYNK_TEMPLATE_ID "TMPL3P38ZMX1b"
-#define BLYNK_TEMPLATE_NAME "Smart Maintenance 360"
-#define BLYNK_AUTH_TOKEN "GS6IK4C8J73rfDYBrJy8qdtJOMU4PztO"
+// --- Physical Pin Connection Numbers on ESP32 Chip ---
+#define PIN_SDA        21  // Data wire pin connected to screen and motion sensor
+#define PIN_SCL        22  // Clock timing wire pin connected to screen and motion sensor
+#define PIN_HR_POT     34  // Input pin reading Heart Rate knob
+#define PIN_BATT_POT   35  // Input pin reading Battery level knob
+#define PIN_LED_G      26  // Output pin connected to Green LED (Safe light)
+#define PIN_LED_Y      25  // Output pin connected to Yellow LED (Warning light)
+#define PIN_LED_R      33  // Output pin connected to Red LED (Emergency light)
+#define PIN_HAPTIC     32  // Output pin connected to Buzzer or Vibrator motor
+#define PIN_SOS        13  // Input pin connected to SOS push button
+#define PIN_PANIC      14  // Input pin connected to test Panic button
+#define PIN_STRUGGLE   19  // Input pin connected to test Struggle button
+#define PIN_IMPACT     18  // Input pin connected to test Fall button
 
-#define BLYNK_PRINT Serial
+// --- Rules and Time Limits (Milliseconds) ---
+const uint32_t CALIB_MS         = 15000;  // 15 seconds required at boot to learn resting heart rate
+const float    HR_SD_FLOOR      = 4.0f;   // Smallest number allowed for division math to prevent bugs
+const float    Z_ELEVATED       = 1.5f;   // Heart rate mark that means heart rate is noticeably high
+const float    Z_STRONG         = 3.0f;   // Heart rate mark that means heart rate is extremely high
+const float    MOVING_G         = 0.08f;  // Motion mark that means body is actively moving
+const float    JERK_VIOLENT     = 0.35f;  // Motion mark that means severe shaking or violence
+const float    FREEFALL_G       = 0.5f;   // Motion mark that means body is falling in air
+const float    IMPACT_G         = 1.7f;   // Motion mark that means body hit the ground hard
+const uint32_t IMPACT_WINDOW    = 600;    // Time window (0.6 seconds) allowed between fall and ground hit
+const uint32_t IMPACT_HOLD      = 3000;   // Keep fall status active for 3 seconds after detection
+const uint32_t PANIC_HOLD_MS    = 4000;   // High heart rate must stay for 4 seconds to trigger alert
+const uint32_t STRUGGLE_HOLD_MS = 1500;   // Violent shaking must stay for 1.5 seconds to trigger alert
+const uint32_t PRE_ALERT_MS     = 10000;  // 10-second warning countdown before sending help request
+const uint32_t CANCEL_HOLD_MS   = 2000;   // Must press and hold SOS button 2 seconds to cancel warning
+const uint32_t COOLDOWN_MS      = 15000;  // 15 seconds pause before new alerts can trigger after cancellation
+const float    LOW_BATT         = 20.0f;  // Battery percentage level considered "Low"
 
-// ============================================================
-// LIBRARIES
-// ============================================================
+// --- Hardware Device Objects ---
+#define MPU_ADDR 0x68                      // Memory address of motion sensor chip
+Adafruit_SSD1306 oled(128, 64, &Wire, -1); // Object controlling the 128x64 pixels OLED screen
 
-#include <Arduino.h>
-#include <Wire.h>
-#include <WiFi.h>
-#include <WiFiClient.h>
-#include <BlynkSimpleEsp32.h>
-#include <WebServer.h>
-#include <PubSubClient.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+// --- Lists of Possible States ---
+enum Ctx   { C_NORMAL, C_EXERCISE, C_PANIC, C_STRUGGLE, C_IMPACT }; // List of possible physical situations
+enum State { S_SAFE, S_PREALERT, S_ALERT };                         // List of band safety states
 
-// ============================================================
-// CONFIGURATION
-// ============================================================
+const char* ctxName[]   = {"NORMAL", "EXERCISE", "PANIC", "STRUGGLE", "IMPACT"}; // Readable words for situations
+const char* stateName[] = {"SAFE", "CHECK", "ALERT"};                             // Readable words for states
 
-#define SIM_MODE true
-#define ENABLE_WIFI true
-#define ENABLE_MQTT true
+// --- Live Sensor & AI Memory Variables ---
+float hrF = 75.0f;        // Variable storing clean filtered Heart Rate
+float battF = 50.0f;      // Variable storing clean filtered Battery percentage
+float actF = 0.0f;        // Variable storing general body movement level
+float jerk = 0.0f;        // Variable storing sudden shaking level
+float zHR = 0.0f;         // Variable storing how unusual the heart rate is right now
+float anomaly = 0.0f;     // Variable storing danger risk score (0 to 100)
 
-const char* MACHINE_ID = "SM360-M01";
+// --- Learned Personal Baseline Values ---
+float hrMu = 75.0f;       // Memory box storing your normal resting heart rate average
+float hrVar = 36.0f;      // Memory box storing your normal heart rate variance range
 
-const char* WIFI_SSID = "Wokwi-GUEST";
-const char* WIFI_PASS = "";
+Ctx ctx = C_NORMAL;       // Active situation classification
+Ctx rawCtx = C_NORMAL;    // Temporary situation classification before double-checking
+State state = S_SAFE;     // Active operating state of the safety band
+State lastState = S_SAFE; // Previous operating state (used to detect state changes)
 
-// MQTT
-const char* MQTT_HOST = "broker.hivemq.com";
-const uint16_t MQTT_PORT = 1883;
-const char* MQTT_TOPIC = "sm360/SM360-M01/telemetry";
+const char* pendingReason = ""; // Text storing reason why warning started
+String alertReason = "";        // Text storing reason why final emergency started
 
-// ============================================================
-// PIN DEFINITIONS
-// ============================================================
+bool panicSim = false;          // True/False flag for test panic button toggle
+bool anomalyPersisted = false;  // True/False flag checking if danger lasted long enough
+bool latencyLogged = false;     // True/False flag to avoid printing duplicate log messages
 
-#define PIN_ONEWIRE 4
+// --- Time Trackers (In Milliseconds) ---
+uint32_t impactSimStart = 0;    // Time when test fall simulation started
+uint32_t struggleSimUntil = 0;  // Time when test shaking simulation should end
+uint32_t freefallMs = 0;        // Time when body started falling in air
+uint32_t impactUntil = 0;       // Expiration time for active fall detection
+uint32_t ctxSince = 0;          // Time when current situation first started
+uint32_t prealertStart = 0;     // Time when 10-second warning countdown started
+uint32_t cooldownUntil = 0;     // Time when cancellation pause period ends
+uint32_t alertTrigMs = 0;       // Time when final emergency was triggered
+uint32_t lastSense = 0;         // Time when sensors were last read
+uint32_t lastOled = 0;          // Time when screen was last updated
+uint32_t lastSerialMs = 0;      // Time when computer log message was last printed
+uint32_t lastBlynkMs = 0;       // Time when phone app was last updated
+uint32_t lastTick = 0;          // Time when last vibration click happened
+uint32_t lastGps = 0;           // Time when simulated GPS position was last updated
 
-#define PIN_SDA 21
-#define PIN_SCL 22
+// --- Button Tracker Variables ---
+uint32_t sosDownMs = 0;         // Time when SOS button was first pressed down
+uint32_t lastPanicBtn = 0;      // Time check for debouncing Panic button
+uint32_t lastStruggleBtn = 0;    // Time check for debouncing Struggle button
+uint32_t lastImpactBtn = 0;     // Time check for debouncing Fall button
+bool sosDown = false;           // True if SOS button is currently being pressed down
+bool sosHandled = false;        // True if SOS button action was already processed
 
-#define PIN_CURRENT 34
-#define PIN_RPM_POT 35
+// --- Counters for System Reports ---
+uint16_t statAlerts = 0;         // Total number of emergency alerts sent
+uint16_t statSOS = 0;            // Total number of manual SOS button presses
+uint16_t statFalseCancelled = 0; // Total number of warnings cancelled by user
+uint16_t statSuppressed = 0;     // Total number of false alarms stopped during exercise
 
-#define PIN_HALL 27
+// --- Motion Memory Window Buffer ---
+const int WIN = 40;     // History buffer size (40 samples)
+float magWin[WIN];      // Array storing recent movement numbers
+int wi = 0;             // Writing index position in array
+int wn = 0;             // Count of valid samples currently in array
 
-#define PIN_LED_G 26
-#define PIN_LED_Y 25
-#define PIN_LED_R 33
+// --- Helper Math Functions ---
 
-#define PIN_BUZZER 32
-#define PIN_BUTTON 13
-
-// ============================================================
-// BASELINE / LIMITS
-// ============================================================
-
-const float TEMP_BASE = 35.0;
-const float TEMP_LIMIT = 65.0;
-
-const float VIB_BASE = 0.03;
-const float VIB_LIMIT = 0.40;
-
-const float CUR_BASE = 1.7;
-const float CUR_LIMIT = 3.5;
-
-const float RPM_BASE = 1380.0;
-const float RPM_LIMIT = 900.0;
-
-// ============================================================
-// HEALTH WEIGHTS
-// ============================================================
-
-const float W_TEMP = 0.25;
-const float W_VIB  = 0.35;
-const float W_CUR  = 0.20;
-const float W_RPM  = 0.20;
-
-// ============================================================
-// OBJECTS
-// ============================================================
-
-#define MPU_ADDR 0x68
-
-OneWire oneWire(PIN_ONEWIRE);
-DallasTemperature ds(&oneWire);
-
-Adafruit_SSD1306 oled(
-  128,
-  64,
-  &Wire,
-  -1
-);
-
-WiFiClient wifiClient;
-PubSubClient mqtt(wifiClient);
-
-WebServer server(80);
-
-// ============================================================
-// STATUS
-// ============================================================
-
-enum Status {
-  NORMAL,
-  ATTENTION,
-  CRITICAL
-};
-
-const char* statusName[] = {
-  "NORMAL",
-  "ATTENTION",
-  "CRITICAL"
-};
-
-// ============================================================
-// VARIABLES
-// ============================================================
-
-float tempF = TEMP_BASE;
-float vibF  = VIB_BASE;
-float curF  = CUR_BASE;
-float rpmF  = RPM_BASE;
-
-float health = 100.0;
-
-Status status = NORMAL;
-Status lastStatus = NORMAL;
-
-bool faultMode = false;
-
-volatile uint32_t pulseCount = 0;
-
-uint32_t lastSerialMs = 0;
-uint32_t lastMqttMs = 0;
-uint32_t lastBlynkMs = 0;
-uint32_t lastBeepMs = 0;
-uint32_t lastMqttTry = 0;
-uint32_t lastBtnMs = 0;
-
-// ============================================================
-// INTERRUPT
-// ============================================================
-
-void IRAM_ATTR onPulse() {
-  pulseCount++;
+// Purpose: Keeps a number strictly between 0.0 and 1.0 to prevent math errors
+float clamp01(float x) { 
+  return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); // If less than 0 return 0, if more than 1 return 1
 }
 
-// ============================================================
-// HELPERS
-// ============================================================
-
-float clamp01(float x) {
-
-  if (x < 0.0f)
-    return 0.0f;
-
-  if (x > 1.0f)
-    return 1.0f;
-
-  return x;
+// Purpose: Smooths out jumpy or noisy sensor readings gently
+void smooth(float &f, float x, float a = 0.3f) { 
+  f += a * (x - f); // Add a small percentage of new value to old average
 }
 
-// ------------------------------------------------------------
-
-float subScore(
-  float x,
-  float base,
-  float limit
-) {
-
-  float denominator = limit - base;
-
-  if (denominator == 0)
-    return 100.0f;
-
-  return 100.0f *
-         (
-           1.0f -
-           clamp01(
-             (x - base) / denominator
-           )
-         );
-}
-
-// ------------------------------------------------------------
-
-void smooth(
-  float &f,
-  float x,
-  float alpha = 0.3f
-) {
-
-  f += alpha * (x - f);
-}
-
-// ============================================================
-// MPU6050
-// ============================================================
-
+// Purpose: Turns on and prepares the MPU6050 motion sensor chip
 void mpuInit() {
-
-  Wire.beginTransmission(MPU_ADDR);
-
-  Wire.write(0x6B);
-  Wire.write(0x00);
-
-  Wire.endTransmission();
+  Wire.beginTransmission(MPU_ADDR); // Address the motion chip on wire bus
+  Wire.write(0x6B);                 // Select power management register
+  Wire.write(0x00);                 // Send wake-up command (turn on chip)
+  Wire.endTransmission();           // Finish sending command
 }
 
-// ------------------------------------------------------------
-
-bool mpuReadAccelG(
-  float &ax,
-  float &ay,
-  float &az
-) {
-
-  Wire.beginTransmission(MPU_ADDR);
-
-  Wire.write(0x3B);
-
-  if (Wire.endTransmission(false) != 0)
-    return false;
-
-  if (
-    Wire.requestFrom(
-      (uint8_t)MPU_ADDR,
-      (uint8_t)6
-    ) != 6
-  )
-    return false;
-
-  int16_t x =
-    (Wire.read() << 8) |
-    Wire.read();
-
-  int16_t y =
-    (Wire.read() << 8) |
-    Wire.read();
-
-  int16_t z =
-    (Wire.read() << 8) |
-    Wire.read();
-
-  ax = x / 16384.0f;
-  ay = y / 16384.0f;
-  az = z / 16384.0f;
-
-  return true;
+// Purpose: Reads raw 3D motion acceleration (X, Y, Z axes) from sensor chip
+bool mpuReadAccelG(float &ax, float &ay, float &az) {
+  Wire.beginTransmission(MPU_ADDR);                       // Address motion chip
+  Wire.write(0x3B);                                       // Point to acceleration data registers
+  if (Wire.endTransmission(false) != 0) return false;     // Hold wire line open
+  if (Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)6) != 6) return false; // Ask for 6 bytes of data
+  
+  int16_t x = (Wire.read() << 8) | Wire.read();           // Read X axis high and low bytes
+  int16_t y = (Wire.read() << 8) | Wire.read();           // Read Y axis high and low bytes
+  int16_t z = (Wire.read() << 8) | Wire.read();           // Read Z axis high and low bytes
+  
+  ax = x / 16384.0f;                                      // Convert raw X number to standard g-force
+  ay = y / 16384.0f;                                      // Convert raw Y number to standard g-force
+  az = z / 16384.0f;                                      // Convert raw Z number to standard g-force
+  return true;                                            // Return success
 }
 
-// ------------------------------------------------------------
-
-float readVibrationG() {
-
-  const int N = 20;
-
-  float sum = 0.0f;
-  int ok = 0;
-
-  for (int i = 0; i < N; i++) {
-
-    float ax;
-    float ay;
-    float az;
-
-    if (
-      mpuReadAccelG(
-        ax,
-        ay,
-        az
-      )
-    ) {
-
-      float magnitude =
-        sqrtf(
-          ax * ax +
-          ay * ay +
-          az * az
-        );
-
-      sum += fabsf(
-        magnitude - 1.0f
-      );
-
-      ok++;
-    }
-
-    delay(2);
+// Purpose: Calculates total physical movement magnitude in 3D space
+float readAccelMag() {
+  uint32_t now = millis(); // Get current clock time in milliseconds
+  
+  // Test Fall sequence handler
+  if (impactSimStart) {
+    uint32_t elapsed = now - impactSimStart;          // Calculate how long fall test has been running
+    if (elapsed < 400) return 0.2f;                   // Phase 1: Simulate weightless free-fall (0.2g)
+    if (elapsed < 500) return 1.9f;                   // Phase 2: Simulate hitting ground hard (1.9g)
+    impactSimStart = 0;                               // Stop simulation after phase 2
   }
-
-  if (ok > 0)
-    return sum / ok;
-
-  return 0.0f;
+  
+  // Test Shaking sequence handler
+  if (now < struggleSimUntil) return random(20, 190) / 100.0f; // Return random violent shaking values
+  
+  // Read real sensor values
+  float ax, ay, az;
+  if (!mpuReadAccelG(ax, ay, az)) return 1.0f;        // If reading fails, return normal resting gravity (1.0g)
+  return sqrtf(ax * ax + ay * ay + az * az);          // Calculate total 3D acceleration magnitude
 }
 
-// ============================================================
-// TEMPERATURE
-// ============================================================
-
-float readTemperatureC() {
-
-  static uint32_t tReq = 0;
-  static float last = TEMP_BASE;
-
-  if (
-    millis() - tReq >= 800
-  ) {
-
-    float t =
-      ds.getTempCByIndex(0);
-
-    if (
-      t != DEVICE_DISCONNECTED_C &&
-      t > -50
-    ) {
-      last = t;
-    }
-
-    ds.requestTemperatures();
-
-    tReq = millis();
-  }
-
-  return last;
-}
-
-// ============================================================
-// CURRENT
-// ============================================================
-
-float readCurrentA() {
-
+// Purpose: Reads heart rate value from simulation knob
+float readHeartRate() {
 #if SIM_MODE
-
-  return
-    analogRead(PIN_CURRENT) *
-    (3.4f / 4095.0f);
-
+  return analogRead(PIN_HR_POT) * (150.0f / 4095.0f); // Convert knob position (0-4095) to Heart Rate (0-150 BPM)
 #else
-
-  const float DIV = 2.0f / 3.0f;
-  const float ZERO_V = 2.5f;
-  const float SENS = 0.185f;
-
-  float mv = 0;
-
-  for (int i = 0; i < 20; i++) {
-
-    mv +=
-      analogReadMilliVolts(
-        PIN_CURRENT
-      );
-  }
-
-  float vout =
-    (mv / 20.0f / 1000.0f) /
-    DIV;
-
-  return
-    fabsf(vout - ZERO_V) /
-    SENS;
-
+  return 75.0f;                                       // Default value if simulation mode is off
 #endif
 }
 
-// ============================================================
-// RPM
-// ============================================================
-
-float readRPM() {
-
+// Purpose: Reads battery percentage level from simulation knob
+float readBattery() {
 #if SIM_MODE
-
-  return
-    analogRead(PIN_RPM_POT) *
-    (2760.0f / 4095.0f);
-
+  return analogRead(PIN_BATT_POT) * (100.0f / 4095.0f); // Convert knob position (0-4095) to Battery % (0-100%)
 #else
-
-  static uint32_t lastMs = millis();
-  static float rpm = 0;
-
-  uint32_t now = millis();
-
-  if (
-    now - lastMs >= 1000
-  ) {
-
-    noInterrupts();
-
-    uint32_t c =
-      pulseCount;
-
-    pulseCount = 0;
-
-    interrupts();
-
-    rpm =
-      c *
-      60000.0f /
-      (now - lastMs);
-
-    lastMs = now;
-  }
-
-  return rpm;
-
+  return 100.0f;                                        // Default 100% if simulation mode is off
 #endif
 }
 
-// ============================================================
-// HEALTH CALCULATION
-// ============================================================
-
-void computeHealth() {
-
-  float st =
-    subScore(
-      tempF,
-      TEMP_BASE,
-      TEMP_LIMIT
-    );
-
-  float sv =
-    subScore(
-      vibF,
-      VIB_BASE,
-      VIB_LIMIT
-    );
-
-  float sc =
-    subScore(
-      curF,
-      CUR_BASE,
-      CUR_LIMIT
-    );
-
-  float sr =
-    subScore(
-      rpmF,
-      RPM_BASE,
-      RPM_LIMIT
-    );
-
-  health =
-    W_TEMP * st +
-    W_VIB  * sv +
-    W_CUR  * sc +
-    W_RPM  * sr;
-
-  if (health >= 90)
-    status = NORMAL;
-
-  else if (health >= 70)
-    status = ATTENTION;
-
-  else
-    status = CRITICAL;
+// Purpose: Saves new movement reading into circular history memory array
+void pushMag(float m) { 
+  magWin[wi] = m;               // Save reading into current array slot
+  wi = (wi + 1) % WIN;          // Move writing position forward by 1 slot
+  if (wn < WIN) wn++;           // Increase stored sample count until full
 }
 
-// ============================================================
-// EXPLANATION / XAI
-// ============================================================
-
-String explain() {
-
-  bool vibHigh =
-    vibF > 0.10;
-
-  bool rpmLow =
-    rpmF < RPM_BASE * 0.97;
-
-  bool tempHigh =
-    tempF > 45;
-
-  bool curHigh =
-    curF > 2.2;
-
-  String s = "";
-
-  if (vibHigh)
-    s += "vibration high; ";
-
-  if (rpmLow)
-    s += "RPM low; ";
-
-  if (tempHigh)
-    s += "temperature high; ";
-
-  if (curHigh)
-    s += "current high; ";
-
-  if (s == "")
-    return "All readings near baseline.";
-
-  if (
-    vibHigh &&
-    rpmLow
-  ) {
-
-    s +=
-      "possible mechanical issue "
-      "(imbalance/looseness/bearing wear) "
-      "- inspect machine.";
-
-  } else {
-
-    s +=
-      "inspection recommended.";
+// Purpose: Calculates how erratic or sudden body shaking is (Jerk score)
+float magStd() {
+  if (wn < 10) return 0.0f;     // Need at least 10 samples to calculate proper average
+  
+  float sum = 0.0f; 
+  for (int i = 0; i < wn; i++) sum += magWin[i]; // Add up all movement samples
+  float mean = sum / wn;                         // Calculate average movement
+  
+  float var = 0.0f;
+  for (int i = 0; i < wn; i++) { 
+    float diff = magWin[i] - mean;               // Measure difference from average
+    var += diff * diff;                          // Square difference
   }
-
-  return s;
+  return sqrtf(var / wn);                        // Return standard deviation shaking score
 }
 
-// ============================================================
-// WEB DASHBOARD
-// ============================================================
-
-void handleRoot() {
-
-  String html =
-
-    "<!DOCTYPE html>"
-    "<html>"
-    "<head>"
-    "<meta charset='utf-8'>"
-    "<meta http-equiv='refresh' content='2'>"
-
-    "<title>"
-    "Smart Maintenance 360"
-    "</title>"
-
-    "<style>"
-
-    "body{"
-    "font-family:Arial,sans-serif;"
-    "background:#121212;"
-    "color:#e0e0e0;"
-    "text-align:center;"
-    "padding:20px;"
-    "}"
-
-    ".card{"
-    "background:#1e1e1e;"
-    "border-radius:8px;"
-    "padding:20px;"
-    "margin:10px auto;"
-    "max-width:400px;"
-    "box-shadow:0 4px 8px rgba(0,0,0,0.3);"
-    "}"
-
-    "h1{color:#4CAF50;}"
-
-    ".status-NORMAL{color:#4CAF50;}"
-    ".status-ATTENTION{color:#FFC107;}"
-    ".status-CRITICAL{color:#F44336;}"
-
-    "table{"
-    "width:100%;"
-    "margin-top:10px;"
-    "}"
-
-    "td{"
-    "padding:8px;"
-    "border-bottom:1px solid #333;"
-    "text-align:left;"
-    "}"
-
-    "</style>"
-    "</head>"
-
-    "<body>"
-
-    "<div class='card'>"
-
-    "<h1>Smart Maintenance 360</h1>"
-
-    "<h3>Machine: " +
-    String(MACHINE_ID) +
-    "</h3>"
-
-    "<h2>Health: " +
-    String(health, 0) +
-    "%</h2>"
-
-    "<p>Status: <b class='status-" +
-    String(statusName[status]) +
-    "'>" +
-    String(statusName[status]) +
-    "</b></p>"
-
-    "<table>"
-
-    "<tr>"
-    "<td>Temperature</td>"
-    "<td>" +
-    String(tempF, 1) +
-    " &deg;C</td>"
-    "</tr>"
-
-    "<tr>"
-    "<td>Vibration</td>"
-    "<td>" +
-    String(vibF, 3) +
-    " g</td>"
-    "</tr>"
-
-    "<tr>"
-    "<td>Current</td>"
-    "<td>" +
-    String(curF, 2) +
-    " A</td>"
-    "</tr>"
-
-    "<tr>"
-    "<td>RPM</td>"
-    "<td>" +
-    String(rpmF, 0) +
-    " RPM</td>"
-    "</tr>"
-
-    "<tr>"
-    "<td>Bearing Fault Mode</td>"
-    "<td>" +
-    String(
-      faultMode
-      ? "ACTIVE (Simulated)"
-      : "OFF"
-    ) +
-    "</td>"
-    "</tr>"
-
-    "</table>"
-
-    "</div>"
-
-    "</body>"
-    "</html>";
-
-  server.send(
-    200,
-    "text/html",
-    html
-  );
+// Purpose: Monitors motion pattern to detect hard falls
+void detectImpact(float mag) {
+  uint32_t now = millis();                       // Get current clock time
+  
+  if (mag < FREEFALL_G) freefallMs = now;        // Mark timestamp if body is falling in air
+  
+  // Check if body hits ground hard within 0.6 seconds after falling
+  if (freefallMs && mag > IMPACT_G && now - freefallMs < IMPACT_WINDOW) {
+    freefallMs = 0;                              // Reset fall timer
+    impactUntil = now + IMPACT_HOLD;             // Set active Fall impact status for 3 seconds
+  }
+  
+  if (freefallMs && now - freefallMs >= IMPACT_WINDOW) freefallMs = 0; // Clear outdated fall attempts
 }
 
-// ============================================================
-// API
-// ============================================================
-
-void handleApiData() {
-
-  char json[400];
-
-  snprintf(
-    json,
-    sizeof(json),
-
-    "{\"id\":\"%s\","
-    "\"temp\":%.1f,"
-    "\"vib\":%.3f,"
-    "\"current\":%.2f,"
-    "\"rpm\":%.0f,"
-    "\"health\":%.0f,"
-    "\"status\":\"%s\","
-    "\"fault\":%s}",
-
-    MACHINE_ID,
-    tempF,
-    vibF,
-    curF,
-    rpmF,
-    health,
-    statusName[status],
-
-    faultMode
-      ? "true"
-      : "false"
-  );
-
-  server.send(
-    200,
-    "application/json",
-    json
-  );
+// Purpose: Automatically learns wearer's personal resting heart rate average over time
+void updateBaseline() {
+  float alpha = (millis() < CALIB_MS) ? 0.08f : 0.002f; // Learn quickly at boot, slowly afterwards
+  float diff = hrF - hrMu;                              // Calculate gap between current HR and average
+  
+  hrMu += alpha * diff;                                 // Adjust resting heart rate average
+  hrVar = (1.0f - alpha) * (hrVar + alpha * diff * diff); // Adjust normal heart rate variation range
 }
 
-// ============================================================
-// ALERTS
-// ============================================================
+// Purpose: Mini-AI Classifier that guesses what user is doing right now
+Ctx classify() {
+  bool moving  = actF > MOVING_G;       // True if body is actively moving
+  bool violent = jerk > JERK_VIOLENT;   // True if body is shaking violently
+  
+  if (millis() < impactUntil)                 return C_IMPACT;   // User fell down hard
+  if (violent && zHR > 2.0f)                  return C_STRUGGLE; // User is struggling violently
+  if (!moving && zHR > Z_STRONG)              return C_PANIC;    // User has fear/panic spike while still
+  if (moving && !violent && zHR > Z_ELEVATED) return C_EXERCISE; // User is exercising normally
+  
+  return C_NORMAL;                                               // Everything is safe and normal
+}
 
-void updateAlerts() {
+// Purpose: Computes overall risk score from 0 (Safe) to 100 (Extreme Danger)
+float computeAnomaly() {
+  float hrScore  = 100.0f * clamp01((zHR - Z_ELEVATED) / 3.0f); // Convert high heart rate to 0-100 score
+  float motScore = 100.0f * clamp01((jerk - 0.15f) / 0.6f);     // Convert violent shaking to 0-100 score
+  
+  switch (ctx) {
+    case C_IMPACT:   return 100.0f;                           // Hard fall = 100% Danger
+    case C_STRUGGLE: return 0.5f * hrScore + 0.5f * motScore; // Combination of motion and heart rate
+    case C_PANIC:    return 0.8f * hrScore;                   // Mostly based on heart rate spike
+    case C_EXERCISE: return 0.3f * hrScore;                   // Suppress danger score while exercising
+    default:         return 0.0f;                             // Normal = 0% Danger
+  }
+}
 
-  digitalWrite(
-    PIN_LED_G,
-    status == NORMAL
-  );
+// Purpose: Sends current sensor numbers and safety state to Blynk phone app
+void updateBlynk() {
+#if ENABLE_WIFI
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V0, hrF);               // V0: Heart Rate (Integer)
+    Blynk.virtualWrite(V1, stateName[state]);  // V1: Safety Status (String: SAFE, CHECK, ALERT)
+    Blynk.virtualWrite(V2, (state == S_ALERT) ? 1 : 0); // V2: SOS Flag (0 or 1)
+    Blynk.virtualWrite(V3, battF);             // V3: Battery Level (Integer 0-100)
+    Blynk.virtualWrite(V4, ctxName[ctx]);      // V4: Activity (String: NORMAL, PANIC, IMPACT, etc.)
+  }
+#endif
+}
 
-  digitalWrite(
-    PIN_LED_Y,
-    status == ATTENTION
-  );
+// Purpose: Triggers active emergency dispatch mode
+void raiseAlert(const char* reason) {
+  state = S_ALERT;               // Change band state to ALERT (Emergency)
+  alertReason = reason;          // Save reason description
+  alertTrigMs = millis();        // Record emergency start time
+  statAlerts++;                  // Increase total emergency count
+  
+  Serial.printf("*** EMERGENCY ALERT: %s | Situation: %s ***\n", reason, ctxName[ctx]); // Print log
+  updateBlynk();                 // Immediately notify phone app
+}
 
-  digitalWrite(
-    PIN_LED_R,
-    status == CRITICAL
-  );
+// Purpose: Stops ongoing warning or clears active emergency
+void cancelAlert() {
+  if (state == S_PREALERT) {
+    statFalseCancelled++;        // Increase cancelled false-alarm count
+    Serial.println("Warning cancelled by user.");
+  } else if (state == S_ALERT) {
+    Serial.println("Alert cleared by user.");
+  } else return;
+  
+  state = S_SAFE;                        // Return band to SAFE state
+  cooldownUntil = millis() + COOLDOWN_MS; // Start 15-second pause to prevent instant re-triggering
+  updateBlynk();                         // Update phone app
+}
 
-  if (status != lastStatus) {
+// Purpose: Main decision engine checking whether to trigger 10-second warning or alert
+void updateDecision() {
+  uint32_t now = millis();               // Get current clock time
 
-    if (status == ATTENTION) {
+  if (ctx != rawCtx) {                   // If situation changed recently
+    rawCtx = ctx;                        // Update temporary situation tracker
+    ctxSince = now;                      // Record time when new situation started
+  }
+  
+  // Calculate how long danger must stay before triggering
+  uint32_t requiredHold = (ctx == C_PANIC) ? PANIC_HOLD_MS : (ctx == C_STRUGGLE ? STRUGGLE_HOLD_MS : 0);
+  anomalyPersisted = (ctx == C_IMPACT) || 
+                     ((ctx == C_PANIC || ctx == C_STRUGGLE) && (now - ctxSince >= requiredHold));
 
-      tone(
-        PIN_BUZZER,
-        1500,
-        150
-      );
+  // If safe, but persistent danger detected -> Start 10-second warning countdown
+  if (state == S_SAFE && now > CALIB_MS && now > cooldownUntil && anomalyPersisted) {
+    state = S_PREALERT;                  // Change state to PREALERT (10s warning)
+    prealertStart = now;                 // Mark start time of warning countdown
+    pendingReason = ctxName[ctx];        // Save danger reason
+    Serial.printf("Danger detected: %s! Countdown started...\n", pendingReason);
+  }
+  
+  // If 10-second warning countdown expires -> Trigger final Emergency Alert
+  if (state == S_PREALERT && now - prealertStart >= PRE_ALERT_MS) {
+    raiseAlert(pendingReason);
+  }
+}
+
+// Purpose: Monitors physical push buttons (SOS, Panic, Struggle, Impact)
+void handleButtons() {
+  uint32_t now = millis();               // Get current clock time
+  bool sos = digitalRead(PIN_SOS) == LOW;// Check if SOS button is being pressed down
+
+  // Detect moment SOS button is first pressed down
+  if (sos && !sosDown) { 
+    sosDown = true;                      // Mark button as down
+    sosDownMs = now;                     // Record press start time
+    sosHandled = false;                  // Reset processed flag
+  }
+  
+  // If user holds SOS button for 2 full seconds -> Cancel active warning/alert
+  if (sos && sosDown && !sosHandled && (now - sosDownMs >= CANCEL_HOLD_MS)) {
+    sosHandled = true;                   // Mark action handled
+    cancelAlert();                       // Cancel warning or alert
+  }
+  
+  // If user releases SOS button quickly (short press) -> Immediate Help Request
+  if (!sos && sosDown) {
+    sosDown = false;                     // Mark button as released
+    if (!sosHandled && (now - sosDownMs > 30) && (now - sosDownMs < CANCEL_HOLD_MS)) {
+      if (state == S_SAFE) { 
+        statSOS++;                       // Increase manual SOS press count
+        raiseAlert("SOS_BUTTON");        // Trigger immediate emergency alert
+      } else if (state == S_PREALERT) { 
+        raiseAlert(pendingReason);       // Instantly confirm warning countdown
+      }
     }
-
-    if (status == CRITICAL) {
-
-      tone(
-        PIN_BUZZER,
-        2500,
-        300
-      );
-    }
-
-    Serial.printf(
-      "EVENT,%s,%lu ms,%s -> %s,"
-      "health=%.0f,%s\n",
-
-      MACHINE_ID,
-      millis(),
-
-      statusName[lastStatus],
-      statusName[status],
-
-      health,
-
-      explain().c_str()
-    );
-
-    lastStatus = status;
   }
 
-  if (
-    status == CRITICAL &&
-    millis() - lastBeepMs > 1000
-  ) {
-
-    tone(
-      PIN_BUZZER,
-      2500,
-      200
-    );
-
-    lastBeepMs =
-      millis();
+  // Handle test Panic button press
+  if (digitalRead(PIN_PANIC) == LOW && now - lastPanicBtn > 300) {
+    panicSim = !panicSim;                // Toggle test panic state ON/OFF
+    lastPanicBtn = now;                  // Save last button press time
+    Serial.printf("Panic Test: %s\n", panicSim ? "ON" : "OFF");
+  }
+  
+  // Handle test Struggle button press
+  if (digitalRead(PIN_STRUGGLE) == LOW && now - lastStruggleBtn > 1000) {
+    struggleSimUntil = now + 3000;       // Trigger 3 seconds of shaking simulation
+    lastStruggleBtn = now;               // Save last button press time
+    Serial.println("Struggle Test Active.");
+  }
+  
+  // Handle test Fall impact button press
+  if (digitalRead(PIN_IMPACT) == LOW && now - lastImpactBtn > 1500) {
+    impactSimStart = now;                // Start test fall simulation sequence
+    lastImpactBtn = now;                 // Save last button press time
+    Serial.println("Fall / Impact Test Active.");
   }
 }
 
-// ============================================================
-// OLED
-// ============================================================
+// Purpose: Makes buzzer noise or vibration pulse
+void haptic(uint16_t ms) {
+#if DISCREET_MODE
+  tone(PIN_HAPTIC, 200, ms);             // Soft 200Hz tactile vibration pulse
+#else
+  tone(PIN_HAPTIC, 2500, ms);            // Loud 2500Hz emergency alarm sound
+#endif
+}
 
+// Purpose: Controls LED status lights (Green, Yellow, Red) and alarm sound
+void updateOutputs() {
+  uint32_t now = millis();               // Get current clock time
+  bool blink = (now / 300) % 2;          // Toggle flag ON/OFF every 300ms for blinking effects
+  bool suspicious = (ctx == C_PANIC || ctx == C_STRUGGLE || ctx == C_IMPACT); // True if danger detected
+
+  digitalWrite(PIN_LED_G, state == S_SAFE && !suspicious);                     // Green ON if safe
+  digitalWrite(PIN_LED_Y, (state == S_SAFE && suspicious) || (state == S_PREALERT && blink)); // Yellow blinking if warning
+  digitalWrite(PIN_LED_R, state == S_ALERT && blink);                          // Red blinking if active emergency
+
+  // Provide gentle periodic vibration clicks during 10-second warning countdown
+  if (state == S_PREALERT && now - lastTick > 1500) { 
+    haptic(80);                          // 80ms gentle click
+    lastTick = now;                      // Save last click time
+  }
+
+  // Provide haptic confirmation when entering active emergency state
+  if (state != lastState) {
+    if (state == S_ALERT) { haptic(120); } // 120ms confirmation click
+    lastState = state;                   // Save current state as last state
+  }
+}
+
+// Purpose: Draws current status text and numbers onto small OLED screen
 void updateOled() {
-
-  oled.clearDisplay();
-
-  oled.setTextColor(
-    SSD1306_WHITE
-  );
-
-  oled.setTextSize(1);
-
-  oled.setCursor(0, 0);
-
-  oled.print(
-    MACHINE_ID
-  );
-
-  if (faultMode) {
-
-    oled.setCursor(
-      96,
-      0
-    );
-
-    oled.print(
-      "FAULT"
-    );
-  }
-
-  oled.setTextSize(2);
-
-  oled.setCursor(
-    0,
-    12
-  );
-
-  oled.printf(
-    "HEALTH:%.0f",
-    health
-  );
-
-  oled.setTextSize(1);
-
-  oled.setCursor(
-    0,
-    32
-  );
-
-  oled.printf(
-    "STATUS: %s",
-    statusName[status]
-  );
-
-  oled.setCursor(
-    0,
-    44
-  );
-
-  oled.printf(
-    "T:%.0fC V:%.2fg",
-    tempF,
-    vibF
-  );
-
-  oled.setCursor(
-    0,
-    54
-  );
-
-  oled.printf(
-    "I:%.1fA N:%.0frpm",
-    curF,
-    rpmF
-  );
-
-  oled.display();
-}
-
-// ============================================================
-// MQTT CONNECTION
-// ============================================================
-
-void connectMqtt() {
-
-#if ENABLE_MQTT
-
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-  // Already connected
-  if (mqtt.connected()) {
-
-    mqtt.loop();
-
-    return;
-  }
-
-  // Retry only every 10 seconds
-  if (
-    millis() - lastMqttTry < 10000
-  ) {
-    return;
-  }
-
-  lastMqttTry = millis();
-
-  String clientID =
-    "SM360-" +
-    String(
-      (uint32_t)ESP.getEfuseMac(),
-      HEX
-    );
-
-  Serial.print(
-    "Connecting MQTT to "
-  );
-
-  Serial.print(
-    MQTT_HOST
-  );
-
-  Serial.print(":");
-
-  Serial.println(
-    MQTT_PORT
-  );
-
-  if (
-    mqtt.connect(
-      clientID.c_str()
-    )
-  ) {
-
-    Serial.println(
-      "MQTT connected!"
-    );
-
-    mqtt.publish(
-      MQTT_TOPIC,
-      "{\"machine\":\"SM360-M01\",\"message\":\"online\"}"
-    );
-
+  oled.clearDisplay();                         // Clear previous drawing buffer
+  oled.setTextColor(SSD1306_WHITE);            // Set text color to white
+  
+  // Draw Top Bar: Title and Battery %
+  oled.setTextSize(1);                         // Small text size
+  oled.setCursor(0, 0);  oled.print("SAFEBAND AI"); // Draw device title at top left
+  oled.setCursor(84, 0); oled.printf("B:%.0f%%", battF); // Draw battery % at top right
+  
+  // Draw Main State Text in Middle
+  oled.setTextSize(2);                         // Medium large text size
+  oled.setCursor(0, 11);                       // Position cursor in screen center
+  if (millis() < CALIB_MS) oled.print("LEARNING"); // Show "LEARNING" during first 15s boot period
+  else                     oled.print(stateName[state]); // Show active state (SAFE, CHECK, or ALERT)
+  
+  // Draw AI Situation and Vital Metrics
+  oled.setTextSize(1);                         // Small text size
+  oled.setCursor(0, 31); oled.printf("Ctx: %s", ctxName[ctx]); // Show situation name
+  oled.setCursor(0, 42); oled.printf("HR:%.0f z:%.1f A:%.0f", hrF, zHR, anomaly); // Show Heart Rate stats
+  
+  // Draw Bottom Line Info or Warning Messages
+  oled.setCursor(0, 53);                       // Position cursor at bottom of screen
+  if (state == S_PREALERT) {
+    uint32_t remaining = (PRE_ALERT_MS - (millis() - prealertStart)) / 1000 + 1; // Calculate seconds remaining
+    oled.printf("Sending in %lus", (unsigned long)remaining); // Draw countdown remaining time
+  } else if (state == S_ALERT) {
+    oled.print("HELP DISPATCHED");             // Show help dispatched confirmation message
+  } else if (battF < LOW_BATT) {
+    oled.print("LOW BATTERY");                 // Show low battery warning message
   } else {
-
-    Serial.print(
-      "MQTT connection failed. State: "
-    );
-
-    Serial.println(
-      mqtt.state()
-    );
+    oled.printf("%.4f,%.4f", gpsLat, gpsLon);   // Draw current GPS location coordinates
   }
-
-#endif
+  
+  oled.display();                              // Refresh physical OLED screen with new drawings
 }
 
-// ============================================================
-// MQTT PUBLISH
-// ============================================================
-
-void publishData() {
-
-#if ENABLE_MQTT
-
-  if (!mqtt.connected())
-    return;
-
-  char payload[400];
-
-  snprintf(
-    payload,
-    sizeof(payload),
-
-    "{\"id\":\"%s\","
-    "\"temp\":%.1f,"
-    "\"vib\":%.3f,"
-    "\"current\":%.2f,"
-    "\"rpm\":%.0f,"
-    "\"health\":%.0f,"
-    "\"status\":\"%s\","
-    "\"fault\":%s}",
-
-    MACHINE_ID,
-
-    tempF,
-    vibF,
-    curF,
-    rpmF,
-    health,
-
-    statusName[status],
-
-    faultMode
-      ? "true"
-      : "false"
-  );
-
-  bool success =
-    mqtt.publish(
-      MQTT_TOPIC,
-      payload
-    );
-
-  if (success) {
-
-    Serial.println(
-      "MQTT telemetry published."
-    );
-
-  } else {
-
-    Serial.println(
-      "MQTT publish failed."
-    );
-  }
-
-#endif
-}
-
-// ============================================================
-// BLYNK DATA
-// ============================================================
-
-void sendBlynkData() {
-
-#if ENABLE_WIFI
-
-  if (!Blynk.connected())
-    return;
-
-  Blynk.virtualWrite(
-    V0,
-    health
-  );
-
-  Blynk.virtualWrite(
-    V1,
-    tempF
-  );
-
-  Blynk.virtualWrite(
-    V2,
-    vibF
-  );
-
-  Blynk.virtualWrite(
-    V3,
-    curF
-  );
-
-  Blynk.virtualWrite(
-    V4,
-    rpmF
-  );
-
-  Blynk.virtualWrite(
-    V5,
-    statusName[status]
-  );
-
-#endif
-}
-
-// ============================================================
-// DIGITAL MACHINE PASSPORT
-// ============================================================
-
-void printPassport() {
-
-  Serial.println();
-
-  Serial.println(
-    "================================"
-  );
-
-  Serial.println(
-    " DIGITAL MACHINE PASSPORT"
-  );
-
-  Serial.println(
-    "================================"
-  );
-
-  Serial.printf(
-    "Machine ID : %s\n",
-    MACHINE_ID
-  );
-
-  Serial.println(
-    "Model      : DC-Motor-12V-001"
-  );
-
-  Serial.println(
-    "Voltage    : 12V DC"
-  );
-
-  Serial.printf(
-    "Baseline   : "
-    "T=%.0fC "
-    "V=%.2fg "
-    "I=%.1fA "
-    "N=%.0frpm\n",
-
-    TEMP_BASE,
-    VIB_BASE,
-    CUR_BASE,
-    RPM_BASE
-  );
-
-  Serial.println(
-    "================================"
-  );
-}
-
-// ============================================================
-// SETUP
-// ============================================================
-
+// --- SETUP METHOD (Runs ONCE when device turns on) ---
 void setup() {
+  Serial.begin(115200);                         // Start high-speed computer communication monitor
+  
+  // Set LED and Buzzer pins as Outputs (device controls them)
+  pinMode(PIN_LED_G, OUTPUT);                   // Set Green LED pin as output
+  pinMode(PIN_LED_Y, OUTPUT);                   // Set Yellow LED pin as output
+  pinMode(PIN_LED_R, OUTPUT);                   // Set Red LED pin as output
+  pinMode(PIN_HAPTIC, OUTPUT);                  // Set Buzzer pin as output
+  
+  // Set Button pins as Inputs with internal pull-up resistors (device reads them)
+  pinMode(PIN_SOS, INPUT_PULLUP);               // Set SOS button pin as input with resistor
+  pinMode(PIN_PANIC, INPUT_PULLUP);             // Set Panic button pin as input with resistor
+  pinMode(PIN_STRUGGLE, INPUT_PULLUP);          // Set Struggle button pin as input with resistor
+  pinMode(PIN_IMPACT, INPUT_PULLUP);             // Set Fall button pin as input with resistor
+  
+  analogReadResolution(12);                     // Configure ADC measurement precision (0-4095 range)
 
-  Serial.begin(
-    115200
-  );
+  // Start two-wire hardware communication bus
+  Wire.begin(PIN_SDA, PIN_SCL);                 // Start I2C bus using pin 21 (Data) and pin 22 (Clock)
+  mpuInit();                                    // Initialize motion sensor chip
 
-  delay(500);
-
-  // ---------------- GPIO ----------------
-
-  pinMode(
-    PIN_LED_G,
-    OUTPUT
-  );
-
-  pinMode(
-    PIN_LED_Y,
-    OUTPUT
-  );
-
-  pinMode(
-    PIN_LED_R,
-    OUTPUT
-  );
-
-  pinMode(
-    PIN_BUZZER,
-    OUTPUT
-  );
-
-  pinMode(
-    PIN_BUTTON,
-    INPUT_PULLUP
-  );
-
-  pinMode(
-    PIN_HALL,
-    INPUT_PULLUP
-  );
-
-  attachInterrupt(
-    digitalPinToInterrupt(
-      PIN_HALL
-    ),
-    onPulse,
-    FALLING
-  );
-
-  analogReadResolution(
-    12
-  );
-
-  // ---------------- I2C ----------------
-
-  Wire.begin(
-    PIN_SDA,
-    PIN_SCL
-  );
-
-  // ---------------- MPU6050 ----------------
-
-  mpuInit();
-
-  // ---------------- DS18B20 ----------------
-
-  ds.begin();
-
-  ds.requestTemperatures();
-
-  ds.setWaitForConversion(
-    false
-  );
-
-  // ---------------- OLED ----------------
-
-  if (
-    !oled.begin(
-      SSD1306_SWITCHCAPVCC,
-      0x3C
-    )
-  ) {
-
-    Serial.println(
-      "OLED not found"
-    );
-
-  } else {
-
-    oled.clearDisplay();
-
-    oled.setTextColor(
-      SSD1306_WHITE
-    );
-
-    oled.setTextSize(1);
-
-    oled.setCursor(
-      0,
-      0
-    );
-
-    oled.println(
-      "SMART MAINTENANCE 360"
-    );
-
-    oled.setCursor(
-      0,
-      16
-    );
-
-    oled.println(
-      MACHINE_ID
-    );
-
-    oled.setCursor(
-      0,
-      32
-    );
-
-    oled.println(
-      "Starting..."
-    );
-
-    oled.display();
+  // Start OLED screen device
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Start screen at address 0x3C
+    Serial.println("OLED screen failed!");      // Print error if screen not connected properly
   }
-
-  // ========================================================
-  // WIFI
-  // ========================================================
+  oled.clearDisplay();                          // Clear screen buffer
+  oled.setTextColor(SSD1306_WHITE);             // Set text color
+  oled.setTextSize(1);                          // Set text size
+  oled.setCursor(0, 0);  oled.println("SAFEBAND AI"); // Show welcome message line 1
+  oled.setCursor(0, 16); oled.println("Connecting to Blynk..."); // Show welcome message line 2
+  oled.display();                               // Push drawings to screen
 
 #if ENABLE_WIFI
-
-  Serial.println();
-
-  Serial.println(
-    "Connecting to WiFi..."
-  );
-
-  WiFi.mode(
-    WIFI_STA
-  );
-
-  WiFi.begin(
-    WIFI_SSID,
-    WIFI_PASS,
-    6
-  );
-
-  uint32_t wifiStart =
-    millis();
-
-  while (
-    WiFi.status() != WL_CONNECTED &&
-    millis() - wifiStart < 8000
-  ) {
-
-    delay(250);
-
-    Serial.print(".");
-  }
-
-  if (
-    WiFi.status() == WL_CONNECTED
-  ) {
-
-    Serial.println();
-
-    Serial.println(
-      "WiFi connected!"
-    );
-
-    Serial.print(
-      "IP Address: "
-    );
-
-    Serial.println(
-      WiFi.localIP()
-    );
-
-    // ---------------- BLYNK ----------------
-
-    Blynk.config(
-      BLYNK_AUTH_TOKEN
-    );
-
-    Serial.println(
-      "Connecting to Blynk..."
-    );
-
-    if (
-      Blynk.connect(5000)
-    ) {
-
-      Serial.println(
-        "Blynk connected!"
-      );
-
-    } else {
-
-      Serial.println(
-        "Blynk connection failed."
-      );
-    }
-
-    // ---------------- MQTT ----------------
-
-#if ENABLE_MQTT
-
-    mqtt.setServer(
-      MQTT_HOST,
-      MQTT_PORT
-    );
-
-    Serial.println(
-      "MQTT configured."
-    );
-
+  // Connect device to WiFi internet router and Blynk phone app
+  Serial.println("Connecting to Blynk...");     // Log connection attempt
+  Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS); // Start WiFi connection and login to Blynk app
 #endif
 
-    // ---------------- WEB SERVER ----------------
-
-    server.on(
-      "/",
-      handleRoot
-    );
-
-    server.on(
-      "/api/data",
-      handleApiData
-    );
-
-    server.begin();
-
-    Serial.println(
-      "Web server started."
-    );
-
-  } else {
-
-    Serial.println();
-
-    Serial.println(
-      "WiFi not connected."
-    );
-
-    Serial.println(
-      "Continuing in offline mode."
-    );
-  }
-
-#endif
-
-  // ---------------- INITIAL STATE ----------------
-
-  tempF = TEMP_BASE;
-  vibF = VIB_BASE;
-  curF = CUR_BASE;
-  rpmF = RPM_BASE;
-
-  health = 100;
-
-  status = NORMAL;
-  lastStatus = NORMAL;
-
-  computeHealth();
-
-  updateAlerts();
-
-  updateOled();
-
-  printPassport();
-
-  Serial.println();
-
-  Serial.println(
-    "SMART MAINTENANCE 360 READY"
-  );
-
-  Serial.println();
+  // Display connection success message on screen
+  oled.clearDisplay();                          // Clear screen
+  oled.setCursor(0, 0);  oled.println("SAFEBAND AI"); // Show title
+  oled.setCursor(0, 16); oled.println("Blynk Connected!"); // Show success message
+  oled.display();                               // Push drawings to screen
+  delay(1000);                                  // Pause 1 second so wearer can read screen
 }
 
-// ============================================================
-// LOOP
-// ============================================================
-
+// --- MAIN LOOP METHOD (Runs CONTINUOUSLY forever) ---
 void loop() {
+  uint32_t now = millis();                      // Get current clock time in milliseconds
+  
+  // Maintain active connection and process phone app data
+#if ENABLE_WIFI
+  Blynk.run();                                  // Keep connection active with Blynk phone app
+#endif
 
-  // ========================================================
-  // BUTTON
-  // ========================================================
+  // Step 1: Read physical push buttons
+  handleButtons();                              // Process SOS and simulation button presses
 
-  if (
-    digitalRead(PIN_BUTTON) == LOW
-  ) {
+  // Step 2: Read physical motion sensor
+  float mag = readAccelMag();                   // Get total 3D body movement magnitude
+  pushMag(mag);                                 // Store reading in circular history array
+  detectImpact(mag);                            // Check if body fell down hard
+  smooth(actF, fabsf(mag - 1.0f), 0.05f);       // Smooth movement delta average
+  jerk = magStd();                              // Calculate shaking / erratic movement level
 
-    if (
-      millis() - lastBtnMs > 500
-    ) {
-
-      faultMode =
-        !faultMode;
-
-      lastBtnMs =
-        millis();
-
-      Serial.print(
-        "Bearing Fault Mode: "
-      );
-
-      Serial.println(
-        faultMode
-          ? "ACTIVE"
-          : "OFF"
-      );
+  // Step 3: Read Heart Rate and Battery every 200 milliseconds (5 times per second)
+  if (now - lastSense >= 200) {
+    lastSense = now;                            // Save last read timestamp
+    
+    float hrSample = readHeartRate();            // Read Heart Rate knob value
+    if (panicSim) hrSample += 50.0f;            // Add +50 BPM if test panic simulation is active
+    
+    smooth(hrF, hrSample);                       // Smooth raw Heart Rate value
+    smooth(battF, readBattery(), 0.1f);          // Smooth raw Battery percentage
+    
+    // Calculate how unusual current heart rate is compared to normal resting average
+    zHR = (hrF - hrMu) / fmaxf(sqrtf(hrVar), HR_SD_FLOOR);
+    
+    // Run mini-AI classifier to guess current situation
+    ctx = (now < CALIB_MS) ? C_NORMAL : classify();
+    anomaly = computeAnomaly();                 // Calculate composite danger score (0-100)
+    
+    if (ctx == C_EXERCISE) statSuppressed++;     // Count exercise suppression events
+    
+    // Update normal resting heart rate memory when safe and resting
+    if (now < CALIB_MS || (ctx == C_NORMAL && state == S_SAFE)) {
+      updateBaseline();                         // Adjust resting heart rate average
     }
   }
 
-  // ========================================================
-  // SENSOR READINGS
-  // ========================================================
-
-  float newTemp =
-    readTemperatureC();
-
-  float newVib =
-    readVibrationG();
-
-  float newCur =
-    readCurrentA();
-
-  float newRPM =
-    readRPM();
-
-  // ========================================================
-  // SMOOTH READINGS
-  // ========================================================
-
-  smooth(
-    tempF,
-    newTemp,
-    0.3f
-  );
-
-  smooth(
-    vibF,
-    newVib,
-    0.3f
-  );
-
-  smooth(
-    curF,
-    newCur,
-    0.3f
-  );
-
-  smooth(
-    rpmF,
-    newRPM,
-    0.3f
-  );
-
-  // ========================================================
-  // SIMULATED BEARING FAULT
-  // ========================================================
-
-  if (faultMode) {
-
-    if (tempF < 52.0f)
-      tempF = 52.0f;
-
-    if (vibF < 0.18f)
-      vibF = 0.18f;
-
-    if (curF < 2.6f)
-      curF = 2.6f;
-
-    if (rpmF > 1050.0f)
-      rpmF = 1050.0f;
+  // Step 4: Slowly update simulated GPS location every 2 seconds when moving
+  if (now - lastGps >= 2000) {
+    lastGps = now;                              // Save last GPS update time
+    if (actF > MOVING_G) {                      // If user is actively walking or moving
+      gpsLat += random(-5, 6) * 1e-5f;          // Drift latitude position slightly
+      gpsLon += random(-5, 6) * 1e-5f;          // Drift longitude position slightly
+    }
   }
 
-  // ========================================================
-  // HEALTH
-  // ========================================================
+  // Step 5: Run safety decision state machine and update lights/buzzers
+  updateDecision();                             // Check warnings and alert countdowns
+  updateOutputs();                              // Update LED lights and vibration clicks
 
-  computeHealth();
-
-  // ========================================================
-  // ALERTS
-  // ========================================================
-
-  updateAlerts();
-
-  // ========================================================
-  // SERIAL + OLED
-  // ========================================================
-
-  if (
-    millis() - lastSerialMs >= 1000
-  ) {
-
-    lastSerialMs =
-      millis();
-
-    updateOled();
-
-    Serial.printf(
-      "T=%.1fC | "
-      "V=%.3fg | "
-      "I=%.2fA | "
-      "RPM=%.0f | "
-      "Health=%.0f | "
-      "%s\n",
-
-      tempF,
-      vibF,
-      curF,
-      rpmF,
-      health,
-      statusName[status]
-    );
+  // Step 6: Redraw OLED screen status every 250 milliseconds (4 times per second)
+  if (now - lastOled >= 250) { 
+    lastOled = now;                             // Save screen update time
+    updateOled();                               // Draw new screen graphics
   }
 
-  // ========================================================
-  // WIFI FUNCTIONS
-  // ========================================================
-
-#if ENABLE_WIFI
-
-  if (
-    WiFi.status() == WL_CONNECTED
-  ) {
-
-    // Blynk
-    Blynk.run();
-
-    // Web server
-    server.handleClient();
-
-    // MQTT
-    connectMqtt();
+  // Step 7: Send live sensor data to Blynk phone app every 1 second
+  if (now - lastBlynkMs >= 1000) {
+    lastBlynkMs = now;                          // Save Blynk update time
+    updateBlynk();                              // Upload numbers to mobile app
   }
 
-  // ========================================================
-  // BLYNK UPDATE
-  // ========================================================
-
-  if (
-    millis() - lastBlynkMs >= 1000
-  ) {
-
-    lastBlynkMs =
-      millis();
-
-    sendBlynkData();
+  // Step 8: Print text log report to computer console screen every 1 second
+  if (now - lastSerialMs >= 1000) {
+    lastSerialMs = now;                         // Save serial log time
+    Serial.printf("HR=%.0f (mu=%.0f z=%.1f) Act=%.2f Jerk=%.2f Ctx=%s Anom=%.0f Batt=%.0f%% %s\n",
+                  hrF, hrMu, zHR, actF, jerk, ctxName[ctx], anomaly, battF, stateName[state]); // Print log text
+    if (battF < LOW_BATT) Serial.println("  Warning: Low Battery!"); // Print battery warning if low
   }
 
-  // ========================================================
-  // MQTT UPDATE
-  // ========================================================
-
-#if ENABLE_MQTT
-
-  if (
-    millis() - lastMqttMs >= 2000
-  ) {
-
-    lastMqttMs =
-      millis();
-
-    publishData();
-  }
-
-#endif
-
-#endif
-
-  // Small delay
-  delay(10);
+  delay(10); // Small 10 millisecond pause to keep ESP32 running smoothly without overheating
 }
